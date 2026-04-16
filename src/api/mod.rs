@@ -241,9 +241,23 @@ async fn api_error_from(resp: reqwest::Response) -> ApiError {
 }
 
 fn encode(s: &str) -> String {
-    // Minimal percent-encoding for path segments. Good enough for the
-    // characters used in socket / channel IDs (`:` and `/` must pass
-    // through unchanged so `as:ns/name` forms remain intact).
-    // reqwest handles most of it, but `%` itself needs escaping.
-    s.replace('%', "%25")
+    // Percent-encode characters that are unsafe in a path segment per
+    // RFC 3986. The `/` inside addresses like `as:ns/name` must be
+    // escaped to `%2F` so the server doesn't split it as a routing
+    // delimiter; `:` and other sub-delims are legal in `pchar` and
+    // pass through.
+    use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+    const PATH_SEGMENT: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'%')
+        .add(b'/')
+        .add(b'<')
+        .add(b'>')
+        .add(b'?')
+        .add(b'`')
+        .add(b'{')
+        .add(b'}');
+    utf8_percent_encode(s, PATH_SEGMENT).to_string()
 }

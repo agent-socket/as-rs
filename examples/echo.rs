@@ -61,10 +61,7 @@ async fn main() -> ExitCode {
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
-        _ = {
-            let mut agent = agent;
-            async move { agent.wait().await }
-        } => {}
+        _ = agent.wait() => {}
     }
 
     ExitCode::from(0)

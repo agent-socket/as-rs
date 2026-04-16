@@ -145,7 +145,7 @@ async fn reconnects_after_drop() {
     .await;
 
     let (events, handler) = collector();
-    let mut agent = connect(
+    let agent = connect(
         "tok",
         "as:test/me",
         handler,
@@ -186,7 +186,7 @@ async fn stops_on_auth_error() {
     .await;
 
     let (_events, handler) = collector();
-    let mut agent = connect(
+    let agent = connect(
         "bad-token",
         "as:test/me",
         handler,
@@ -266,6 +266,131 @@ async fn send_blocks_until_connected() {
     );
 
     agent.close().await;
+    let _ = stop.send(()).await;
+}
+
+#[tokio::test]
+async fn close_is_sticky_between_cycles() {
+    // Server always closes the connection after a short delay, so the
+    // supervisor keeps cycling. We call close() at a moment when the
+    // supervisor is between select! polls — the cancellation must
+    // still stop the loop promptly.
+    let (url, _attempts, stop) = serve(|_n, mut ws| async move {
+        sleep(Duration::from_millis(50)).await;
+        let _ = ws
+            .close(Some(CloseFrame {
+                code: CloseCode::Error,
+                reason: "drop".into(),
+            }))
+            .await;
+    })
+    .await;
+
+    let (_events, handler) = collector();
+    let agent = connect(
+        "tok",
+        "as:test/me",
+        handler,
+        Config {
+            endpoint: url,
+            min_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_millis(100),
+        },
+    );
+
+    // Let it complete at least one cycle.
+    sleep(Duration::from_millis(200)).await;
+
+    // Close should return within 1s even though cycles keep churning.
+    timeout(Duration::from_secs(1), agent.close())
+        .await
+        .expect("close() hung past the cancellation window");
+
+    let _ = stop.send(()).await;
+}
+
+#[tokio::test]
+async fn wait_is_shared() {
+    // Multiple tasks can concurrently wait on the same agent.
+    let (url, stop) = serve_rejecting(
+        StatusCode::UNAUTHORIZED,
+        r#"{"error_code":"E1001","error_message":"bad"}"#,
+    )
+    .await;
+
+    let (_events, handler) = collector();
+    let agent = Arc::new(connect(
+        "bad",
+        "as:test/me",
+        handler,
+        Config {
+            endpoint: url,
+            min_backoff: Duration::from_millis(30),
+            max_backoff: Duration::from_millis(60),
+        },
+    ));
+
+    let a1 = Arc::clone(&agent);
+    let a2 = Arc::clone(&agent);
+    let w1 = tokio::spawn(async move { a1.wait().await });
+    let w2 = tokio::spawn(async move { a2.wait().await });
+
+    timeout(Duration::from_secs(3), async {
+        w1.await.unwrap();
+        w2.await.unwrap();
+    })
+    .await
+    .expect("concurrent wait()s did not return");
+
+    let _ = stop.send(()).await;
+}
+
+#[tokio::test]
+async fn drop_signals_shutdown() {
+    // Dropping Agent without calling close() should still stop the
+    // supervisor. We observe that via the server: once the client
+    // disconnects and does not reconnect within the backoff window,
+    // the server sees no new attempts.
+    let (url, attempts, stop) = serve(|_n, mut ws| async move {
+        sleep(Duration::from_millis(50)).await;
+        let _ = ws
+            .close(Some(CloseFrame {
+                code: CloseCode::Error,
+                reason: "drop".into(),
+            }))
+            .await;
+    })
+    .await;
+
+    {
+        let (_events, handler) = collector();
+        let _agent = connect(
+            "tok",
+            "as:test/me",
+            handler,
+            Config {
+                endpoint: url,
+                min_backoff: Duration::from_millis(50),
+                max_backoff: Duration::from_millis(100),
+            },
+        );
+        // Let it connect + reconnect a few times so attempts > 0.
+        sleep(Duration::from_millis(300)).await;
+    } // Agent dropped here.
+
+    let before = *attempts.lock().unwrap();
+    assert!(before > 0, "test precondition: server saw no attempts");
+
+    // After drop, no more reconnect attempts should land even though
+    // the server is still accepting (the supervisor has stopped).
+    sleep(Duration::from_millis(400)).await;
+    let after = *attempts.lock().unwrap();
+    assert_eq!(
+        before, after,
+        "supervisor kept reconnecting after Agent drop (before={}, after={})",
+        before, after
+    );
+
     let _ = stop.send(()).await;
 }
 
